@@ -32,7 +32,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/BurntSushi/toml"
+	"toml"
 )
 
 const (
@@ -49,16 +49,25 @@ const (
 )
 
 var (
-	confFile    = flag.String("conf", "/usr/local/etc/agitator.conf", "Configuration file")
-	config      Config
-	rtable      RouteTable
-	addFwdFor   bool
-	dialTimeout time.Duration
-	srvTimeout  time.Duration
-	cltTimeout  time.Duration
-	debug       bool
-	clientTLS   tls.Config
+	confFile     = flag.String("conf", "/usr/local/etc/agitator.conf", "Configuration file")
+	config       Config
+	rtable       RouteTable
+	addFwdFor    bool
+	dialTimeout  time.Duration
+	srvTimeout   time.Duration
+	cltTimeout   time.Duration
+	debug        bool
+	clientTLS    tls.Config
+	routeByUID   bool
+	serversByUID ServersByUID
+	rTableByUID  RouteTableByUID
 )
+
+// ServersByUID ordered
+type ServersByUID struct {
+	sync.RWMutex
+	servers []*Server
+}
 
 // AgiSession holds the data of an active AGI session
 type AgiSession struct {
@@ -67,25 +76,31 @@ type AgiSession struct {
 	FwdFor    string   // List of originating IPs
 	Request   *url.URL // Client Request
 	Server    *Server  // Destination server
+	UID       string   // Agi UID parameter
 }
 
 // Config struct holds the various settings values after parsing the config file.
 type Config struct {
-	Listen     string
-	Port       uint16
-	TLSListen  string `toml:"tls_listen"`
-	TLSPort    uint16 `toml:"tls_port"`
-	TLSStrict  bool   `toml:"tls_strict"`
-	TLSCert    string `toml:"tls_cert"`
-	TLSKey     string `toml:"tls_key"`
-	FwdFor     bool   `toml:"fwd_for"`
-	ConTimeout int    `toml:"con_timeout"`
-	SrvTimeout int    `toml:"srv_timeout"`
-	CltTimeout int    `toml:"clt_timeout"`
-	Log        string
-	Debug      bool
-	Threads    int
-	Route      []struct {
+	Listen       string
+	Port         uint16
+	TLSListen    string `toml:"tls_listen"`
+	TLSPort      uint16 `toml:"tls_port"`
+	TLSStrict    bool   `toml:"tls_strict"`
+	TLSCert      string `toml:"tls_cert"`
+	TLSKey       string `toml:"tls_key"`
+	FwdFor       bool   `toml:"fwd_for"`
+	ConTimeout   int    `toml:"con_timeout"`
+	SrvTimeout   int    `toml:"srv_timeout"`
+	CltTimeout   int    `toml:"clt_timeout"`
+	RoutingByUID bool   `toml:"routing_by_uid"`
+	Servers      []struct {
+		Addr string
+		Port uint16
+	}
+	Log     string
+	Debug   bool
+	Threads int
+	Route   []struct {
 		Path string
 		Mode string
 		Host []struct {
@@ -95,6 +110,12 @@ type Config struct {
 			Max  int
 		}
 	}
+}
+
+// RouteTableByUID holds the routing table uid -> Server
+type RouteTableByUID struct {
+	sync.RWMutex
+	Route map[string]*Server
 }
 
 // RouteTable holds the routing table
@@ -165,6 +186,20 @@ func init() {
 	cltTimeout = time.Duration(float64(config.CltTimeout)) * time.Second
 	clientTLS = tls.Config{InsecureSkipVerify: !config.TLSStrict}
 	debug = config.Debug
+
+	routeByUID = config.RoutingByUID
+	// Generate servers table from config file data
+	servers, err := genServersByUID(config)
+	if err != nil {
+		log.Fatal(err)
+	}
+	serversByUID.Lock()
+	serversByUID.servers = servers
+	serversByUID.Unlock()
+
+	rTableByUID.Lock()
+	rTableByUID.Route = make(map[string]*Server, 0)
+	rTableByUID.Unlock()
 
 	// Generate routing table from config file data
 	table, err := genRtable(config)
@@ -256,7 +291,11 @@ func connHandle(conn net.Conn, wg *sync.WaitGroup) {
 		return
 	}
 	// Do the routing
-	err = sess.route()
+	if routeByUID {
+		err = sess.routeByUID()
+	} else {
+		err = sess.route()
+	}
 	if err != nil {
 		log.Println(err)
 		sess.ClientCon.Write([]byte(agiFail))
@@ -332,6 +371,16 @@ func (s *AgiSession) parseEnv() ([]byte, error) {
 			s.FwdFor = string(line[ind : len(line)-1])
 		} else {
 			agiEnv = append(agiEnv, line...)
+
+			if routeByUID && string(line[:ind]) == "agi_uniqueid" && len(line) >= ind+len(": \n") {
+				log.Println(string(line))
+				uid := string(line[ind : len(line)-1])
+				if uid == "" {
+					err = fmt.Errorf("%v: Non valid AGI request", s.ClientCon.RemoteAddr())
+				} else {
+					s.UID = uid
+				}
+			}
 		}
 	}
 	if req == "" {
@@ -340,6 +389,63 @@ func (s *AgiSession) parseEnv() ([]byte, error) {
 		s.Request, err = url.Parse(req)
 	}
 	return agiEnv, err
+}
+
+// Route based on uid
+func (s *AgiSession) routeByUID() error {
+	var err error
+	client := s.ClientCon.RemoteAddr()
+	clientUID := s.UID
+
+	if debug {
+		log.Printf("%v: New request: %s\n", client, clientUID)
+	}
+	// Find route
+	rTableByUID.Lock()
+	defer rTableByUID.Unlock()
+	server, ok := rTableByUID.Route[clientUID]
+	if ok {
+		s.ServerCon, err = makeConn(server)
+		if err == nil {
+			s.Request.Host = server.Host
+			s.Server = server
+			rTableByUID.Route[clientUID] = server
+			return err
+		}
+	}
+
+	serversByUID.Lock()
+	defer serversByUID.Unlock()
+	serversCount := len(serversByUID.servers)
+	for i := 0; i < serversCount; i++ {
+		server = serversByUID.servers[0]
+		// Move to round robin
+		if serversCount > 1 {
+			serversByUID.servers[0] = serversByUID.servers[serversCount-1]
+			serversByUID.servers[serversCount-1] = server
+		}
+		s.ServerCon, err = makeConn(server)
+		if err == nil {
+			s.Request.Host = server.Host
+			s.Server = server
+			rTableByUID.Route[clientUID] = server
+			return err
+		}
+	}
+	return err
+}
+
+func makeConn(server *Server) (net.Conn, error) {
+	if debug {
+		log.Printf("Trying server %s", server.Host)
+	}
+	dialer := new(net.Dialer)
+	dialer.Timeout = dialTimeout
+	conn, err := dialer.Dial("tcp", server.Host)
+	if err != nil {
+		log.Printf("%v: Failed to connect to %s, %s\n", client, server.Host, err)
+	}
+	return conn, err
 }
 
 // Route based on request path
@@ -450,6 +556,20 @@ func sigHandle(schan <-chan os.Signal, s *int32, wg *sync.WaitGroup) {
 			rtable.Unlock()
 		}
 	}
+}
+
+// Generate Servers from config
+func genServersByUID(conf Config) ([]*Server, error) {
+	var err error
+	table := make([]*Server, 0)
+	for _, server := range conf.Servers {
+		s := new(Server)
+		s.Host = server.Addr + ":" + strconv.Itoa(int(server.Port))
+		s.TLS = false
+		s.Max = 0
+		table = append(table, s)
+	}
+	return table, err
 }
 
 // Generate Routing table from config data
