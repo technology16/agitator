@@ -115,7 +115,7 @@ type Config struct {
 // RouteTableByUID holds the routing table uid -> Server
 type RouteTableByUID struct {
 	sync.RWMutex
-	Route map[string]*Server
+	Route TTLMap
 }
 
 // RouteTable holds the routing table
@@ -160,6 +160,63 @@ func (s ByActive) Less(i, j int) bool {
 	return res
 }
 
+// TTL map item
+type item struct {
+	value      *Server
+	lastAccess int64
+}
+
+// TTL map
+type TTLMap struct {
+	m map[string]*item
+	l sync.Mutex
+}
+
+func New(ln int, maxTTL int) (m *TTLMap) {
+	m = &TTLMap{m: make(map[string]*item, ln)}
+	go func() {
+		for now := range time.Tick(time.Second) {
+			m.l.Lock()
+			for k, v := range m.m {
+				if now.Unix()-v.lastAccess > int64(maxTTL) {
+					if debug {
+						log.Printf("Removing %s by expiration", k)
+					}
+					delete(m.m, k)
+				}
+			}
+			m.l.Unlock()
+		}
+	}()
+	return
+}
+
+func (m *TTLMap) Len() int {
+	return len(m.m)
+}
+
+func (m *TTLMap) Put(k string, v *Server) {
+	m.l.Lock()
+	it, ok := m.m[k]
+	if !ok {
+		it = &item{value: v}
+		m.m[k] = it
+	}
+	it.lastAccess = time.Now().Unix()
+	m.l.Unlock()
+}
+
+func (m *TTLMap) Get(k string) (v *Server, ok bool) {
+	m.l.Lock()
+	if it, ok := m.m[k]; ok {
+		v = it.value
+		it.lastAccess = time.Now().Unix()
+	}
+	m.l.Unlock()
+	return
+
+}
+
 func init() {
 	flag.Parse()
 	// Parse Config file
@@ -198,7 +255,7 @@ func init() {
 	serversByUID.Unlock()
 
 	rTableByUID.Lock()
-	rTableByUID.Route = make(map[string]*Server, 0)
+	rTableByUID.Route = *New(1, 100)
 	rTableByUID.Unlock()
 
 	// Generate routing table from config file data
@@ -401,15 +458,13 @@ func (s *AgiSession) routeByUID() error {
 		log.Printf("%v: New request: %s\n", client, clientUID)
 	}
 	// Find route
-	rTableByUID.Lock()
-	defer rTableByUID.Unlock()
-	server, ok := rTableByUID.Route[clientUID]
+	server, ok := rTableByUID.Route.Get(clientUID)
 	if ok {
 		s.ServerCon, err = makeConn(server)
 		if err == nil {
 			s.Request.Host = server.Host
 			s.Server = server
-			rTableByUID.Route[clientUID] = server
+			rTableByUID.Route.Put(clientUID, server)
 			return err
 		}
 	}
@@ -428,7 +483,7 @@ func (s *AgiSession) routeByUID() error {
 		if err == nil {
 			s.Request.Host = server.Host
 			s.Server = server
-			rTableByUID.Route[clientUID] = server
+			rTableByUID.Route.Put(clientUID, server)
 			return err
 		}
 	}
