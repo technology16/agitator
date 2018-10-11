@@ -147,18 +147,19 @@ func (s ByActive) Less(i, j int) bool {
 	return res
 }
 
-// TTL map item
+// item used in TTLMap like a entry
 type item struct {
 	value      *Server
 	lastAccess int64
 }
 
-// TTL map
+// TTLMap contains entry expired by some time
 type TTLMap struct {
 	l sync.Mutex
 	m map[string]*item
 }
 
+// New creates a TTLMap with size ln and max time to live maxTTL
 func New(ln int, maxTTL int) (m *TTLMap) {
 	m = &TTLMap{m: make(map[string]*item, ln)}
 	go func() {
@@ -178,10 +179,12 @@ func New(ln int, maxTTL int) (m *TTLMap) {
 	return
 }
 
+// Len returns a legth of internal map
 func (m *TTLMap) Len() int {
 	return len(m.m)
 }
 
+// Put puts key and value into internal map
 func (m *TTLMap) Put(k string, v *Server) {
 	m.l.Lock()
 	it, ok := m.m[k]
@@ -193,6 +196,7 @@ func (m *TTLMap) Put(k string, v *Server) {
 	m.l.Unlock()
 }
 
+// Get gets a value by key from internal map
 func (m *TTLMap) Get(k string) (v *Server, ok bool) {
 	m.l.Lock()
 	if it, ok := m.m[k]; ok {
