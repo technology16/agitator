@@ -23,6 +23,7 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -49,25 +50,16 @@ const (
 )
 
 var (
-	confFile     = flag.String("conf", "/usr/local/etc/agitator.conf", "Configuration file")
-	config       Config
-	rtable       RouteTable
-	addFwdFor    bool
-	dialTimeout  time.Duration
-	srvTimeout   time.Duration
-	cltTimeout   time.Duration
-	debug        bool
-	clientTLS    tls.Config
-	routeByUID   bool
-	serversByUID ServersByUID
-	rTableByUID  TTLMap
+	confFile    = flag.String("conf", "/usr/local/etc/agitator.conf", "Configuration file")
+	config      Config
+	rtable      RouteTable
+	addFwdFor   bool
+	dialTimeout time.Duration
+	srvTimeout  time.Duration
+	cltTimeout  time.Duration
+	debug       bool
+	clientTLS   tls.Config
 )
-
-// ServersByUID ordered
-type ServersByUID struct {
-	sync.RWMutex
-	servers []*Server
-}
 
 // AgiSession holds the data of an active AGI session
 type AgiSession struct {
@@ -75,34 +67,33 @@ type AgiSession struct {
 	ServerCon net.Conn
 	FwdFor    string   // List of originating IPs
 	Request   *url.URL // Client Request
+	Script    string   // agi script
 	Server    *Server  // Destination server
-	UID       string   // Agi UID parameter
 }
 
 // Config struct holds the various settings values after parsing the config file.
 type Config struct {
-	Listen       string
-	Port         uint16
-	TLSListen    string `toml:"tls_listen"`
-	TLSPort      uint16 `toml:"tls_port"`
-	TLSStrict    bool   `toml:"tls_strict"`
-	TLSCert      string `toml:"tls_cert"`
-	TLSKey       string `toml:"tls_key"`
-	FwdFor       bool   `toml:"fwd_for"`
-	ConTimeout   int    `toml:"con_timeout"`
-	SrvTimeout   int    `toml:"srv_timeout"`
-	CltTimeout   int    `toml:"clt_timeout"`
-	RoutingByUID bool   `toml:"routing_by_uid"`
-	Servers      []struct {
-		Addr string
-		Port uint16
-	}
+	Listen     string
+	Port       uint16
+	TLSListen  string `toml:"tls_listen"`
+	TLSPort    uint16 `toml:"tls_port"`
+	TLSStrict  bool   `toml:"tls_strict"`
+	TLSCert    string `toml:"tls_cert"`
+	TLSKey     string `toml:"tls_key"`
+	FwdFor     bool   `toml:"fwd_for"`
+	ConTimeout int    `toml:"con_timeout"`
+	SrvTimeout int    `toml:"srv_timeout"`
+	CltTimeout int    `toml:"clt_timeout"`
+
 	Log     string
 	Debug   bool
 	Threads int
 	Route   []struct {
-		Path string
-		Mode string
+		Path             string
+		Mode             string
+		SessionAttribute string `toml:"session_attribute"`
+		SessionTimeout   int    `toml:"session_timeout"`
+
 		Host []struct {
 			Addr string
 			Port uint16
@@ -121,8 +112,10 @@ type RouteTable struct {
 // Destination struct holds a list of hosts and the routing mode
 type Destination struct {
 	sync.RWMutex
-	Hosts []*Server
-	Mode  string
+	Hosts    []*Server
+	Mode     string
+	SesAttr  *regexp.Regexp
+	Sessions *TTLMap
 }
 
 // Server struct holds the server address, TLS setting and the number of active sessions
@@ -162,8 +155,8 @@ type item struct {
 
 // TTL map
 type TTLMap struct {
-	m map[string]*item
 	l sync.Mutex
+	m map[string]*item
 }
 
 func New(ln int, maxTTL int) (m *TTLMap) {
@@ -237,18 +230,6 @@ func init() {
 	cltTimeout = time.Duration(float64(config.CltTimeout)) * time.Second
 	clientTLS = tls.Config{InsecureSkipVerify: !config.TLSStrict}
 	debug = config.Debug
-
-	routeByUID = config.RoutingByUID
-	// Generate servers table from config file data
-	servers, err := genServersByUID(config)
-	if err != nil {
-		log.Fatal(err)
-	}
-	serversByUID.Lock()
-	serversByUID.servers = servers
-	serversByUID.Unlock()
-
-	rTableByUID = *New(1, 100)
 
 	// Generate routing table from config file data
 	table, err := genRtable(config)
@@ -333,18 +314,14 @@ func connHandle(conn net.Conn, wg *sync.WaitGroup) {
 	}()
 
 	// Read the AGI Env variables and parse the request url.
-	env, err := sess.parseEnv()
+	env, agiStrings, err := sess.parseEnv()
 	if err != nil {
 		log.Println(err)
 		sess.ClientCon.Write([]byte(agiFail))
 		return
 	}
 	// Do the routing
-	if routeByUID {
-		err = sess.routeByUID()
-	} else {
-		err = sess.route()
-	}
+	err = sess.route(agiStrings)
 	if err != nil {
 		log.Println(err)
 		sess.ClientCon.Write([]byte(agiFail))
@@ -362,7 +339,8 @@ func connHandle(conn net.Conn, wg *sync.WaitGroup) {
 		}
 		env = append(env, []byte("agi_x_fwd_for: "+sess.FwdFor+"\n")...)
 	}
-	env = append(env, []byte("agi_request: "+sess.Request.String()+"\n\n")...)
+	env = append(env, []byte("agi_request: "+sess.Request.String()+"\n")...)
+	env = append(env, []byte("agi_network_script: "+sess.Script+"\n\n")...)
 	_, err = sess.ServerCon.Write(env)
 	if err != nil {
 		log.Println(err)
@@ -394,10 +372,11 @@ func connHandle(conn net.Conn, wg *sync.WaitGroup) {
 }
 
 // Read the AGI environment, return it and parse the agi_request url.
-func (s *AgiSession) parseEnv() ([]byte, error) {
+func (s *AgiSession) parseEnv() ([]byte, []string, error) {
 	var req string
 	var err error
 	var line []byte
+	var lines []string
 	agiEnv := make([]byte, 0, agiEnvSize)
 	buf := bufio.NewReader(s.ClientCon)
 
@@ -408,6 +387,7 @@ func (s *AgiSession) parseEnv() ([]byte, error) {
 		if err != nil || len(line) <= len("\r\n") {
 			break
 		}
+		lines = append(lines, string(line))
 		ind := bytes.IndexByte(line, ':')
 		if ind == -1 {
 			break
@@ -418,18 +398,10 @@ func (s *AgiSession) parseEnv() ([]byte, error) {
 		} else if addFwdFor && string(line[:ind]) == "agi_x_fwd_for" && len(line) >= ind+len(": \n") {
 			ind += len(": ")
 			s.FwdFor = string(line[ind : len(line)-1])
+		} else if string(line[:ind]) == "agi_network_script" {
+			// skip this and append after route is selected
 		} else {
 			agiEnv = append(agiEnv, line...)
-
-			if routeByUID && string(line[:ind]) == "agi_uniqueid" && len(line) >= ind+len(": \n") {
-				log.Println(string(line))
-				uid := string(line[ind : len(line)-1])
-				if uid == "" {
-					err = fmt.Errorf("%v: Non valid AGI request", s.ClientCon.RemoteAddr())
-				} else {
-					s.UID = uid
-				}
-			}
 		}
 	}
 	if req == "" {
@@ -437,69 +409,29 @@ func (s *AgiSession) parseEnv() ([]byte, error) {
 	} else {
 		s.Request, err = url.Parse(req)
 	}
-	return agiEnv, err
-}
-
-// Route based on uid
-func (s *AgiSession) routeByUID() error {
-	var err error
-	client := s.ClientCon.RemoteAddr()
-	clientUID := s.UID
-
-	if debug {
-		log.Printf("%v: New request: %s\n", client, clientUID)
-	}
-	// Find route
-	server, ok := rTableByUID.Get(clientUID)
-	if ok {
-		s.ServerCon, err = makeConn(server)
-		if err == nil {
-			s.Request.Host = server.Host
-			s.Server = server
-			rTableByUID.Put(clientUID, server)
-			return err
-		}
-	}
-
-	serversByUID.Lock()
-	defer serversByUID.Unlock()
-	serversCount := len(serversByUID.servers)
-	for i := 0; i < serversCount; i++ {
-		server = serversByUID.servers[0]
-		// Move to round robin
-		if serversCount > 1 {
-			serversByUID.servers[0] = serversByUID.servers[serversCount-1]
-			serversByUID.servers[serversCount-1] = server
-		}
-		s.ServerCon, err = makeConn(server)
-		if err == nil {
-			s.Request.Host = server.Host
-			s.Server = server
-			rTableByUID.Put(clientUID, server)
-			return err
-		}
-	}
-	return err
-}
-
-func makeConn(server *Server) (net.Conn, error) {
-	if debug {
-		log.Printf("Trying server %s", server.Host)
-	}
-	dialer := new(net.Dialer)
-	dialer.Timeout = dialTimeout
-	conn, err := dialer.Dial("tcp", server.Host)
-	if err != nil {
-		log.Printf("%v: Failed to connect to %s, %s\n", client, server.Host, err)
-	}
-	return conn, err
+	return agiEnv, lines, err
 }
 
 // Route based on request path
-func (s *AgiSession) route() error {
+func (s *AgiSession) route(agiEnv []string) error {
 	var err error
 	client := s.ClientCon.RemoteAddr()
 	reqPath := strings.TrimPrefix(s.Request.Path, "/")
+	s.Script = reqPath
+
+	indx := strings.Index(reqPath, "/")
+	if indx != -1 {
+		var firstPart = reqPath[0:indx]
+		if debug {
+			log.Println("For routing will be used first part of request")
+		}
+		fixedScript := reqPath[indx+1:]
+		log.Printf("Fixed script: %s\n", fixedScript)
+		s.Request.Path = "/" + fixedScript
+		s.Script = fixedScript
+		reqPath = firstPart
+		log.Println("Request was fixed to ", s.Request)
+	}
 
 	if debug {
 		log.Printf("%v: New request: %s\n", client, s.Request)
@@ -524,6 +456,30 @@ func (s *AgiSession) route() error {
 	} else if debug {
 		log.Printf("%v: Using route: %s\n", client, reqPath)
 	}
+
+	var sessionMarker string
+	// Try to find session in destination
+	for _, agiParameter := range agiEnv {
+		matches := dest.SesAttr.FindStringSubmatch(agiParameter)
+		if len(matches) == 2 {
+			sessionMarker = matches[1]
+		}
+	}
+
+	if sessionMarker != "" {
+		sessionServer, ok := dest.Sessions.Get(sessionMarker)
+		if ok {
+			s.ServerCon, err = makeConn(sessionServer)
+			if err == nil {
+				s.Request.Host = sessionServer.Host
+				s.Server = sessionServer
+				return err
+			}
+		}
+	} else {
+		log.Printf("Cannot find session attribute %s in agi request", dest.SesAttr)
+	}
+
 	// Load Balance mode: Sort servers by number of active sessions
 	if dest.Mode == balance && len(dest.Hosts) > 1 {
 		dest.Lock()
@@ -546,16 +502,13 @@ func (s *AgiSession) route() error {
 			continue
 		}
 		server.RUnlock()
-		dialer := new(net.Dialer)
-		dialer.Timeout = dialTimeout
-		if server.TLS {
-			s.ServerCon, err = tls.DialWithDialer(dialer, "tcp", server.Host, &clientTLS)
-		} else {
-			s.ServerCon, err = dialer.Dial("tcp", server.Host)
-		}
+		s.ServerCon, err = makeConn(server)
 		if err == nil {
 			s.Request.Host = server.Host
 			s.Server = server
+			if sessionMarker != "" {
+				dest.Sessions.Put(sessionMarker, server)
+			}
 			return err
 		} else if debug {
 			log.Printf("%v: Failed to connect to %s, %s\n", client, server.Host, err)
@@ -564,6 +517,17 @@ func (s *AgiSession) route() error {
 
 	//No servers found
 	return fmt.Errorf("%v: Unable to connect to any server", client)
+}
+
+func makeConn(server *Server) (conn net.Conn, err error) {
+	dialer := new(net.Dialer)
+	dialer.Timeout = dialTimeout
+	if server.TLS {
+		conn, err = tls.DialWithDialer(dialer, "tcp", server.Host, &clientTLS)
+	} else {
+		conn, err = dialer.Dial("tcp", server.Host)
+	}
+	return
 }
 
 // Update active session counter
@@ -605,20 +569,6 @@ func sigHandle(schan <-chan os.Signal, s *int32, wg *sync.WaitGroup) {
 	}
 }
 
-// Generate Servers from config
-func genServersByUID(conf Config) ([]*Server, error) {
-	var err error
-	table := make([]*Server, 0)
-	for _, server := range conf.Servers {
-		s := new(Server)
-		s.Host = server.Addr + ":" + strconv.Itoa(int(server.Port))
-		s.TLS = false
-		s.Max = 0
-		table = append(table, s)
-	}
-	return table, err
-}
-
 // Generate Routing table from config data
 func genRtable(conf Config) (map[string]*Destination, error) {
 	var err error
@@ -640,6 +590,8 @@ func genRtable(conf Config) (map[string]*Destination, error) {
 			log.Println("Invalid mode for", route.Path)
 			continue
 		}
+		p.SesAttr = regexp.MustCompile(route.SessionAttribute)
+		p.Sessions = New(0, route.SessionTimeout)
 		p.Hosts = make([]*Server, 0, len(route.Host))
 		for _, server := range route.Host {
 			if server.Port < 1 {
