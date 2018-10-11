@@ -60,7 +60,7 @@ var (
 	clientTLS    tls.Config
 	routeByUID   bool
 	serversByUID ServersByUID
-	rTableByUID  RouteTableByUID
+	rTableByUID  TTLMap
 )
 
 // ServersByUID ordered
@@ -110,12 +110,6 @@ type Config struct {
 			Max  int
 		}
 	}
-}
-
-// RouteTableByUID holds the routing table uid -> Server
-type RouteTableByUID struct {
-	sync.RWMutex
-	Route TTLMap
 }
 
 // RouteTable holds the routing table
@@ -254,9 +248,7 @@ func init() {
 	serversByUID.servers = servers
 	serversByUID.Unlock()
 
-	rTableByUID.Lock()
-	rTableByUID.Route = *New(1, 100)
-	rTableByUID.Unlock()
+	rTableByUID = *New(1, 100)
 
 	// Generate routing table from config file data
 	table, err := genRtable(config)
@@ -458,13 +450,13 @@ func (s *AgiSession) routeByUID() error {
 		log.Printf("%v: New request: %s\n", client, clientUID)
 	}
 	// Find route
-	server, ok := rTableByUID.Route.Get(clientUID)
+	server, ok := rTableByUID.Get(clientUID)
 	if ok {
 		s.ServerCon, err = makeConn(server)
 		if err == nil {
 			s.Request.Host = server.Host
 			s.Server = server
-			rTableByUID.Route.Put(clientUID, server)
+			rTableByUID.Put(clientUID, server)
 			return err
 		}
 	}
@@ -483,7 +475,7 @@ func (s *AgiSession) routeByUID() error {
 		if err == nil {
 			s.Request.Host = server.Host
 			s.Server = server
-			rTableByUID.Route.Put(clientUID, server)
+			rTableByUID.Put(clientUID, server)
 			return err
 		}
 	}
