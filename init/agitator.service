@@ -9,8 +9,6 @@ ExecReload=/bin/kill -HUP $MAINPID
 ExecStop=/bin/kill -INT $MAINPID
 TimeoutStopSec=10
 Restart=always
-LimitNOFILE=32767
-LimitNPROC=32767
 
 [Install]
 WantedBy=multi-user.target

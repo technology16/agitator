@@ -6,7 +6,7 @@ A reverse proxy for the [FastAGI](https://wiki.asterisk.org/wiki/display/AST/AGI
 
 - *Request based routing*
 
- Routes FastAGI sessions depending on the request URI.
+ Routes FastAGI sessions depending on the request URI. Can make a cross session routing by session attribute and session timeout.
 
 - *Load balancing*
 
@@ -31,7 +31,7 @@ A reverse proxy for the [FastAGI](https://wiki.asterisk.org/wiki/display/AST/AGI
 
 To install:
 ```
-	go get github.com/zaf/agitator
+	go get github.com/technology16/agitator
 ```
 To run:
 ```
@@ -39,7 +39,7 @@ To run:
 ```
 
 There is also a simple Makefile that installs the agitator binary in `/usr/local/bin` and its config file in
-`/usr/local/etc` to help with system wide installation. Under the folder [init](https://github.com/zaf/agitator/tree/master/init)
+`/usr/local/etc` to help with system wide installation. Under the folder [init](https://github.com/technology16/agitator/tree/master/init)
 startup scripts are provided for systemd based systems, for Red Hat and Debian based systems that use the old sysV init
 and for systems that use OpenRC.
 
@@ -55,23 +55,25 @@ or send an Interrupt signal (`pkill -INT agitator`) to the agitator process.
 A typical layout where agitator sits between one or more asterisk servers and one or more
 FastAGI servers routing AGI requests providing load balancing and/or high availability:
 
-![alt text](https://raw.githubusercontent.com/zaf/agitator/master/doc/example-1.png)
+![alt text](https://raw.githubusercontent.com/technology16/agitator/master/doc/example-1.png)
+
+**Topologies described below cannot work for now. We can make it work if it is necessary.**
 
 Agitator can make up for asterisk's lack of encryption support on the AGI protocol
 either by wrapping AGI sessions in TLS, sending the traffic over the network,
 unwrapping it and contacting the FastAGI server:
 
-![alt text](https://raw.githubusercontent.com/zaf/agitator/master/doc/example-3.png)
+![alt text](https://raw.githubusercontent.com/technology16/agitator/master/doc/example-3.png)
 
 or by encrypting AGI traffic and directly communicating with TLS aware FastAGI servers:
 
-![alt text](https://raw.githubusercontent.com/zaf/agitator/master/doc/example-2.png)
+![alt text](https://raw.githubusercontent.com/technology16/agitator/master/doc/example-2.png)
 
-An example of such a FastAGI server can be found [here](https://github.com/zaf/agi/blob/master/examples/fastagi-tls.go),
-using the [Go AGI package](https://github.com/zaf/agi). A Perl implementation can be found [here](https://github.com/zaf/scripts/blob/master/fastagi-tls.pl)
+An example of such a FastAGI server can be found [here](https://github.com/technology16/agi/blob/master/examples/fastagi-tls.go),
+using the [Go AGI package](https://github.com/technology16/agi). A Perl implementation can be found [here](https://github.com/technology16/scripts/blob/master/fastagi-tls.pl)
 using Asterisk::AGI and Net::Server::PreFork.
 
-See sample [config file](https://github.com/zaf/agitator/blob/master/sample.conf) for configuration details.
+See sample [config file](https://github.com/technology16/agitator/blob/master/sample.conf) for configuration details.
 
 ---
 
