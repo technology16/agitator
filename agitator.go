@@ -33,7 +33,7 @@ import (
 	"syscall"
 	"time"
 
-	"toml"
+	"github.com/BurntSushi/toml"
 )
 
 const (
