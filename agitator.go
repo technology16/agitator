@@ -109,6 +109,14 @@ type RouteTable struct {
 	Route map[string]*Destination
 }
 
+// Get return value from map by key and flag if present
+func (rT RouteTable) Get(k string) (*Destination, bool) {
+	rT.Lock()
+	v, ok := rT.Route[k]
+	rT.Unlock()
+	return v, ok
+}
+
 // Destination struct holds a list of hosts and the routing mode
 type Destination struct {
 	sync.RWMutex
@@ -187,25 +195,22 @@ func (m *TTLMap) Len() int {
 // Put puts key and value into internal map
 func (m *TTLMap) Put(k string, v *Server) {
 	m.l.Lock()
-	it, ok := m.m[k]
-	if !ok {
-		it = &item{value: v}
-		m.m[k] = it
-	}
-	it.lastAccess = time.Now().Unix()
+	it := &item{value: v, lastAccess: time.Now().Unix()}
+	m.m[k] = it
 	m.l.Unlock()
 }
 
 // Get gets a value by key from internal map
-func (m *TTLMap) Get(k string) (v *Server, ok bool) {
+func (m *TTLMap) Get(k string) (*Server, bool) {
 	m.l.Lock()
-	if it, ok := m.m[k]; ok {
+	var v *Server
+	it, ok := m.m[k]
+	if ok {
 		v = it.value
 		it.lastAccess = time.Now().Unix()
 	}
 	m.l.Unlock()
-	return
-
+	return v, ok
 }
 
 func init() {
@@ -427,30 +432,27 @@ func (s *AgiSession) route(agiEnv []string) error {
 	if indx != -1 {
 		var firstPart = reqPath[0:indx]
 		if debug {
-			log.Println("For routing will be used first part of request")
+			log.Printf("For routing will be used first part of request %s\n", firstPart)
 		}
 		fixedScript := reqPath[indx+1:]
-		log.Printf("Fixed script: %s\n", fixedScript)
 		s.Request.Path = "/" + fixedScript
 		s.Script = fixedScript
 		reqPath = firstPart
-		log.Println("Request was fixed to ", s.Request)
 	}
 
 	if debug {
 		log.Printf("%v: New request: %s\n", client, s.Request)
 	}
 	// Find route
-	rtable.RLock()
-	defer rtable.RUnlock()
-	dest, ok := rtable.Route[reqPath]
+	dest, ok := rtable.Get(reqPath)
+	// Find route by subpath if no route for root present
 	for !ok && reqPath != "" {
 		reqPath, _ = path.Split(reqPath)
 		reqPath = strings.TrimSuffix(reqPath, "/")
-		dest, ok = rtable.Route[reqPath]
+		dest, ok = rtable.Get(reqPath)
 	}
 	if !ok {
-		dest, ok = rtable.Route[wildCard]
+		dest, ok = rtable.Get(wildCard)
 		if !ok {
 			return fmt.Errorf("%v: No route found for %s", client, reqPath)
 		}
@@ -461,8 +463,8 @@ func (s *AgiSession) route(agiEnv []string) error {
 		log.Printf("%v: Using route: %s\n", client, reqPath)
 	}
 
-	var sessionMarker string
 	// Try to find session in destination
+	var sessionMarker string
 	for _, agiParameter := range agiEnv {
 		matches := dest.SesAttr.FindStringSubmatch(agiParameter)
 		if len(matches) == 2 {
@@ -470,18 +472,16 @@ func (s *AgiSession) route(agiEnv []string) error {
 		}
 	}
 
+	hostsToConnect := make([]*Server, 0)
 	if sessionMarker != "" {
 		sessionServer, ok := dest.Sessions.Get(sessionMarker)
 		if ok {
-			s.ServerCon, err = makeConn(sessionServer)
-			if err == nil {
-				s.Request.Host = sessionServer.Host
-				s.Server = sessionServer
-				return err
-			}
+			hostsToConnect = append(hostsToConnect, sessionServer)
+		} else if debug {
+			log.Printf("Cannot find session attribute %s, route by %s will be used", sessionMarker, dest.Mode)
 		}
 	} else {
-		log.Printf("Cannot find session attribute %s in agi request", dest.SesAttr)
+		log.Printf("Cannot find session attribute %s, route by script will be used", dest.SesAttr)
 	}
 
 	// Load Balance mode: Sort servers by number of active sessions
@@ -496,9 +496,12 @@ func (s *AgiSession) route(agiEnv []string) error {
 		dest.Hosts = append(dest.Hosts[1:], dest.Hosts[0])
 		dest.Unlock()
 	}
+
+	hostsToConnect = append(hostsToConnect, dest.Hosts...)
+
 	// Find available servers and connect
-	for i := 0; i < len(dest.Hosts); i++ {
-		server := dest.Hosts[i]
+	for i := 0; i < len(hostsToConnect); i++ {
+		server := hostsToConnect[i]
 		server.RLock()
 		if server.Max > 0 && server.Count >= server.Max {
 			server.RUnlock()
@@ -512,6 +515,9 @@ func (s *AgiSession) route(agiEnv []string) error {
 			s.Server = server
 			if sessionMarker != "" {
 				dest.Sessions.Put(sessionMarker, server)
+				if debug {
+					log.Printf("Save session attribute %s %s to map\n", sessionMarker, server.Host)
+				}
 			}
 			return err
 		} else if debug {
@@ -526,6 +532,9 @@ func (s *AgiSession) route(agiEnv []string) error {
 func makeConn(server *Server) (conn net.Conn, err error) {
 	dialer := new(net.Dialer)
 	dialer.Timeout = dialTimeout
+	if debug {
+		log.Printf("Connecting to %s\n", server.Host)
+	}
 	if server.TLS {
 		conn, err = tls.DialWithDialer(dialer, "tcp", server.Host, &clientTLS)
 	} else {
