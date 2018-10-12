@@ -434,9 +434,9 @@ func (s *AgiSession) route(agiEnv []string) error {
 		if debug {
 			log.Printf("For routing will be used first part of request %s\n", firstPart)
 		}
-		fixedScript := reqPath[indx+1:]
-		s.Request.Path = "/" + fixedScript
-		s.Script = fixedScript
+		fixedScript := reqPath[indx:]
+		s.Request.Path = fixedScript
+		s.Script = strings.TrimPrefix(s.Request.Path, "/")
 		reqPath = firstPart
 	}
 
