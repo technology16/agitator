@@ -111,9 +111,9 @@ type RouteTable struct {
 
 // Get return value from map by key and flag if present
 func (rT *RouteTable) Get(k string) (*Destination, bool) {
-	rT.Lock()
+	rT.RLock()
 	v, ok := rT.Route[k]
-	rT.Unlock()
+	rT.RUnlock()
 	return v, ok
 }
 
