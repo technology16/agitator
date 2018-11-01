@@ -189,7 +189,10 @@ func New(ln int, maxTTL int) (m *TTLMap) {
 
 // Len returns a legth of internal map
 func (m *TTLMap) Len() int {
-	return len(m.m)
+	m.l.Lock()
+	length := len(m.m)
+	m.l.Unlock()
+	return length
 }
 
 // Put puts key and value into internal map
