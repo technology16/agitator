@@ -475,11 +475,15 @@ func (s *AgiSession) route(agiEnv []string) error {
 		}
 	}
 
-	hostsToConnect := make([]*Server, 0)
 	if sessionMarker != "" {
 		sessionServer, ok := dest.Sessions.Get(sessionMarker)
 		if ok {
-			hostsToConnect = append(hostsToConnect, sessionServer)
+			err = s.connToServer(sessionServer, sessionMarker, dest)
+			if err == nil {
+				return err
+			} else if debug {
+				log.Printf("%s\n", err)
+			}
 		} else if debug {
 			log.Printf("Cannot find session attribute %s, route by %s will be used", sessionMarker, dest.Mode)
 		}
@@ -500,17 +504,27 @@ func (s *AgiSession) route(agiEnv []string) error {
 		dest.Unlock()
 	}
 
-	hostsToConnect = append(hostsToConnect, dest.Hosts...)
-
 	// Find available servers and connect
-	for i := 0; i < len(hostsToConnect); i++ {
-		server := hostsToConnect[i]
-		server.RLock()
-		if server.Max > 0 && server.Count >= server.Max {
-			server.RUnlock()
-			log.Printf("%v: Reached connections limit in %s\n", client, server.Host)
-			continue
+	for i := 0; i < len(dest.Hosts); i++ {
+		server := dest.Hosts[i]
+		err = s.connToServer(server, sessionMarker, dest)
+		if err == nil {
+			return err
+		} else if debug {
+			log.Printf("%s\n", err)
 		}
+	}
+
+	//No servers found
+	return fmt.Errorf("%v: Unable to connect to any server", client)
+}
+
+func (s *AgiSession) connToServer(server *Server, sessionMarker string, dest *Destination) (err error) {
+	server.RLock()
+	if server.Max > 0 && server.Count >= server.Max {
+		server.RUnlock()
+		err = fmt.Errorf("%v: Reached connections limit in %s", client, server.Host)
+	} else {
 		server.RUnlock()
 		s.ServerCon, err = makeConn(server)
 		if err == nil {
@@ -522,14 +536,11 @@ func (s *AgiSession) route(agiEnv []string) error {
 					log.Printf("Save session attribute %s %s to map\n", sessionMarker, server.Host)
 				}
 			}
-			return err
-		} else if debug {
-			log.Printf("%v: Failed to connect to %s, %s\n", client, server.Host, err)
+		} else {
+			err = fmt.Errorf("%v: Failed to connect to %s, %s", client, server.Host, err)
 		}
 	}
-
-	//No servers found
-	return fmt.Errorf("%v: Unable to connect to any server", client)
+	return err
 }
 
 func makeConn(server *Server) (conn net.Conn, err error) {
