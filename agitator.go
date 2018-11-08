@@ -50,7 +50,7 @@ const (
 )
 
 var (
-	confFile    = flag.String("conf", "/usr/local/etc/agitator.conf", "Configuration file")
+	confFile    = flag.String("conf", "/usr/share/asterisk/agi-bin/agitator/agitator.conf", "Configuration file")
 	config      Config
 	rtable      RouteTable
 	addFwdFor   bool
