@@ -18,7 +18,7 @@ fi
 ### END INIT INFO
 
 DESC="agitator FastAGI proxy"
-DAEMON=/usr/local/bin/agitator
+DAEMON=/usr/share/asterisk/agi-bin/agitator/agitator
 PIDFILE=/run/agitator.pid
 
 alias do_reload=do_reload_sigusr1

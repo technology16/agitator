@@ -5,8 +5,8 @@
 
 extra_commands="gracefulstop reload"
 
-command="/usr/local/bin/agitator"
-config="/usr/local/etc/agitator.conf"
+command="/usr/share/asterisk/agi-bin/agitator/agitator"
+config="/usr/share/asterisk/agi-bin/agitator/agitator.conf"
 pidfile="/run/agitator.pid"
 
 depend() {
