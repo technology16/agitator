@@ -468,27 +468,17 @@ func (s *AgiSession) route(agiEnv []string) error {
 
 	// Try to find session in destination
 	var sessionMarker string
-	for _, agiParameter := range agiEnv {
-		matches := dest.SesAttr.FindStringSubmatch(agiParameter)
-		if len(matches) == 2 {
-			sessionMarker = matches[1]
-		}
-	}
-
-	if sessionMarker != "" {
-		sessionServer, ok := dest.Sessions.Get(sessionMarker)
-		if ok {
-			err = s.connToServer(sessionServer, sessionMarker, dest)
+	if dest.SesAttr != nil {
+		var server *Server
+		server, sessionMarker = dest.findServerBySessionAttr(agiEnv)
+		if server != nil {
+			err = s.connToServer(server, sessionMarker, dest)
 			if err == nil {
 				return err
 			} else if debug {
 				log.Printf("%s\n", err)
 			}
-		} else if debug {
-			log.Printf("Cannot find session attribute %s, route by %s will be used", sessionMarker, dest.Mode)
 		}
-	} else {
-		log.Printf("Cannot find session attribute %s, route by script will be used", dest.SesAttr)
 	}
 
 	// Load Balance mode: Sort servers by number of active sessions
@@ -517,6 +507,29 @@ func (s *AgiSession) route(agiEnv []string) error {
 
 	//No servers found
 	return fmt.Errorf("%v: Unable to connect to any server", client)
+}
+
+func (dest *Destination) findServerBySessionAttr(agiEnv []string) (*Server, string) {
+	var server *Server
+	var sessionMarker string
+	for _, agiParameter := range agiEnv {
+		matches := dest.SesAttr.FindStringSubmatch(agiParameter)
+		if len(matches) == 2 {
+			sessionMarker = matches[1]
+			break
+		}
+	}
+
+	if sessionMarker != "" {
+		var ok bool
+		server, ok = dest.Sessions.Get(sessionMarker)
+		if !ok && debug {
+			log.Printf("Cannot find session attribute %s, route by %s will be used", sessionMarker, dest.Mode)
+		}
+	} else {
+		log.Printf("Cannot find session attribute %s, route by script will be used", dest.SesAttr)
+	}
+	return server, sessionMarker
 }
 
 func (s *AgiSession) connToServer(server *Server, sessionMarker string, dest *Destination) (err error) {
@@ -617,8 +630,10 @@ func genRtable(conf Config) (map[string]*Destination, error) {
 			log.Println("Invalid mode for", route.Path)
 			continue
 		}
-		p.SesAttr = regexp.MustCompile(route.SessionAttribute)
-		p.Sessions = New(0, route.SessionTimeout)
+		if route.SessionAttribute != "" {
+			p.SesAttr = regexp.MustCompile(route.SessionAttribute)
+			p.Sessions = New(0, route.SessionTimeout)
+		}
 		p.Hosts = make([]*Server, 0, len(route.Host))
 		for _, server := range route.Host {
 			if server.Port < 1 {
